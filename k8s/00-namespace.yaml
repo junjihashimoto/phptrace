@@ -1,0 +1,10 @@
+# The tracer needs privileged + hostPID, so the namespace runs under the
+# "privileged" Pod Security Standard. The demo workload is unprivileged but
+# lives here too for simplicity.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: phptrace
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: privileged

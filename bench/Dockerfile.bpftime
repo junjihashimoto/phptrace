@@ -1,0 +1,58 @@
+# Condition 4: run the SAME per-call eBPF program in userspace via bpftime.
+#
+# The bpftime agent .so is dlopen'd *inside* the php-fpm process, so it must be
+# built against the SAME libc/boost as the php:8.3-fpm image (which is Debian
+# trixie — boost 1.83, yaml-cpp 0.8, glibc 2.41). We therefore build bpftime on
+# the php:8.3-fpm base itself, not on a separate debian tag.
+#
+# Backend: ubpf interpreter (-DBPFTIME_LLVM_JIT=OFF) — no LLVM dependency, and a
+# one-instruction probe doesn't need a JIT.
+
+# Stage A: build bpftime + the percall loader/object on the runtime base.
+FROM php:8.3-fpm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git ca-certificates cmake make gcc g++ pkg-config \
+      clang llvm libbpf-dev \
+      libelf-dev zlib1g-dev libboost-all-dev binutils-dev libyaml-cpp-dev \
+      libncurses-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /bpftime
+ARG BPFTIME_REF=master
+# READ_CHECK=ON (default) -> bpf_probe_read_user = process_vm_readv syscall (fault-safe, slow)
+# READ_CHECK=OFF          -> bpf_probe_read_user = raw memcpy (fast, but bad ptr segfaults host)
+ARG READ_CHECK=ON
+RUN git clone --recursive --depth 1 --branch "${BPFTIME_REF}" \
+      https://github.com/eunomia-bpf/bpftime.git . \
+    && cmake -Bbuild -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+         -DBPFTIME_LLVM_JIT=OFF \
+         -DENABLE_PROBE_READ_CHECK=${READ_CHECK} \
+         -DBUILD_BPFTIME_DAEMON=0 \
+         -DBPFTIME_ENABLE_UNIT_TESTING=0 \
+    && cmake --build build --config RelWithDebInfo -j"$(nproc)"
+RUN mkdir -p /out && \
+    find /bpftime/build -name 'libbpftime-syscall-server.so' -exec cp {} /out/ \; && \
+    find /bpftime/build -name 'libbpftime-agent.so' -exec cp {} /out/ \; && \
+    { find /bpftime/build -name 'libbpftime-agent-transformer.so' -exec cp {} /out/ \; || true; } && \
+    ls -l /out
+
+WORKDIR /percall
+COPY Makefile percall.bpf.c percall_load.c ./
+RUN make
+
+# Stage B: runtime = the demo app image + bpftime + the percall program.
+FROM php:8.3-fpm
+RUN docker-php-ext-install pdo_mysql mysqli opcache >/dev/null
+# Runtime deps for the bpftime agent (boost/yaml/elf) and the loader (libbpf).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libboost-all-dev libyaml-cpp-dev libelf1 zlib1g libbpf1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY fpm-bench.conf /usr/local/etc/php-fpm.d/zz-bench.conf
+COPY --from=build /out/ /opt/bpftime/
+COPY --from=build /percall/percall_load /percall/percall.bpf.o /opt/percall/
+COPY bpftime-entry.sh /opt/bench/bpftime-entry.sh
+RUN chmod +x /opt/bench/bpftime-entry.sh
+ENV BPF_OBJ=/opt/percall/percall.bpf.o
+ENV PHPFPM_BIN=/usr/local/sbin/php-fpm
+ENV BPFTIME_DIR=/opt/bpftime
+ENTRYPOINT ["/opt/bench/bpftime-entry.sh"]

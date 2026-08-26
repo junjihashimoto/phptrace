@@ -1,0 +1,15 @@
+# Observer-API condition: stock php:8.3-fpm + the apmobs Zend extension.
+# Selective in-process hooking (ddtrace-style) — the fair competitor to the
+# eBPF sampler. OBS_ALL / OBS_FUNCS choose what to observe (read at MINIT).
+FROM php:8.3-fpm
+RUN docker-php-ext-install pdo_mysql mysqli opcache >/dev/null
+
+COPY observer/ /tmp/observer/
+RUN cd /tmp/observer \
+    && phpize \
+    && ./configure --enable-apmobs \
+    && make -j"$(nproc)" \
+    && make install \
+    && docker-php-ext-enable apmobs
+
+COPY fpm-bench.conf /usr/local/etc/php-fpm.d/zz-bench.conf

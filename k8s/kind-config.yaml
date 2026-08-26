@@ -1,0 +1,13 @@
+# Single-node kind cluster for the phptrace demo.
+# The node is a Docker container sharing the host (Docker Desktop / LinuxKit)
+# kernel, so eBPF/perf_event work in privileged pods just like docker-compose.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: phptrace
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # expose the UI NodePort on localhost:8092
+      - containerPort: 30080
+        hostPort: 8092
+        protocol: TCP

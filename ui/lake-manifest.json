@@ -1,0 +1,13 @@
+{"version": "1.2.0",
+ "packagesDir": ".lake/packages",
+ "packages":
+ [{"type": "path",
+   "scope": "",
+   "name": "«lean-tea»",
+   "manifestFile": "lake-manifest.json",
+   "inherited": false,
+   "dir": "../lean-tea",
+   "configFile": "lakefile.lean"}],
+ "name": "apm",
+ "lakeDir": ".lake",
+ "fixedToolchain": false}

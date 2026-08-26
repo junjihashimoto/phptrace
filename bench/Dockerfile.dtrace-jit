@@ -1,0 +1,9 @@
+# dtrace PHP (per-call execute_ex) + the LLVM-JIT bpftime, so we can run the
+# per-call work-payload probe JIT-compiled instead of interpreted. Reuses the
+# already-built dtrace php-fpm; only swaps in the JIT bpftime .so's + libLLVM.
+FROM phptrace-php-dtrace
+RUN apt-get update && apt-get install -y --no-install-recommends libllvm19 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=phptrace-php-bench-jit /opt/bpftime/ /opt/bpftime/
+COPY --from=phptrace-php-bench-jit /opt/percall/ /opt/percall/
+ENV BPFTIME_VM_NAME=llvm

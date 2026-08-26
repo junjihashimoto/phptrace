@@ -1,0 +1,16 @@
+# Design B (faithful) — per-request dynamic attach/detach via frida-gadget.
+# Reuses the --enable-dtrace php-fpm from the phptrace-php-dtrace image so
+# dtrace_execute_ex fires per userland call when attached.
+FROM phptrace-php-dtrace:latest
+
+COPY fridaB/frida-gadget.so /opt/fridaB/frida-gadget.so
+COPY fridaB/frida-gadget.config /opt/fridaB/frida-gadget.config
+COPY fridaB/agent.js /opt/fridaB/agent.js.tmpl
+COPY fridaB/entry.sh /opt/fridaB/entry.sh
+COPY fridaB/entry-cli.sh /opt/fridaB/entry-cli.sh
+RUN chmod +x /opt/fridaB/entry.sh /opt/fridaB/entry-cli.sh
+
+ENV USE_ZEND_DTRACE=1
+ENV GADGET=1
+ENV SAMPLE_N=1
+ENTRYPOINT ["/opt/fridaB/entry.sh"]

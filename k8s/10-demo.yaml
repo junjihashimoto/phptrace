@@ -1,0 +1,166 @@
+# Demo workload to be traced: a completely ordinary, UNPRIVILEGED PHP
+# application (nginx + php-fpm 8.3 + MySQL). The point of the demo is that
+# the phptrace agent DaemonSet discovers and profiles this without the app
+# knowing or cooperating — no sidecar, no code change, no privileges.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init
+  namespace: phptrace
+data:
+  init.sql: |
+    CREATE TABLE IF NOT EXISTS profile_info (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id BIGINT NOT NULL,
+      nickname VARCHAR(64) NOT NULL,
+      bio TEXT,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_user (user_id)
+    );
+    INSERT INTO profile_info (user_id, nickname, bio)
+    SELECT seq * 1000 + 48909, CONCAT('user', seq), REPEAT('lorem ipsum ', 20)
+    FROM (
+      SELECT a.n + b.n * 10 + c.n * 100 AS seq
+      FROM (SELECT 0 n UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+            UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a,
+           (SELECT 0 n UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+            UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b,
+           (SELECT 0 n UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+            UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) c
+    ) seqs;
+    CREATE TABLE IF NOT EXISTS activity_log (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id BIGINT NOT NULL,
+      action VARCHAR(32) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: phptrace
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: mysql } }
+  template:
+    metadata: { labels: { app: mysql } }
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.4
+          args: ["--mysql-native-password=ON"]
+          env:
+            - { name: MYSQL_ROOT_PASSWORD, value: root }
+            - { name: MYSQL_DATABASE, value: demo }
+            - { name: MYSQL_USER, value: demo }
+            - { name: MYSQL_PASSWORD, value: demo }
+          ports: [{ containerPort: 3306 }]
+          volumeMounts:
+            - { name: init, mountPath: /docker-entrypoint-initdb.d }
+      volumes:
+        - name: init
+          configMap: { name: mysql-init }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: phptrace
+spec:
+  selector: { app: mysql }
+  ports: [{ port: 3306, targetPort: 3306 }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-conf
+  namespace: phptrace
+data:
+  default.conf: |
+    server {
+      listen 80;
+      root /var/www/html;
+      index index.php;
+      location / { try_files $uri /index.php$is_args$args; }
+      location = /index.php {
+        fastcgi_pass 127.0.0.1:9000;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        # FPM copies SCRIPT_NAME into request_info.request_uri (what the
+        # eBPF request-boundary probe reads); hand it the real URI.
+        fastcgi_param SCRIPT_NAME $request_uri;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: php-demo
+  namespace: phptrace
+  labels: { app: php-demo }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: php-demo } }
+  template:
+    metadata: { labels: { app: php-demo } }
+    spec:
+      # hostPID here is a KIND-ONLY workaround: kind nests pid namespaces
+      # (VM-init > kind-node > pod), so a pod's PIDs don't line up with the
+      # global PIDs the kernel/BPF reports. Sharing the node PID ns fixes the
+      # alignment. On a REAL node the node PID ns IS the init ns, so an
+      # ordinary app pod (no hostPID, no privileges, no sidecar) is traced
+      # as-is — the agent needs no cooperation from the workload.
+      hostPID: true
+      containers:
+        - name: php-fpm
+          image: phptrace-php:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: DB_DSN, value: "mysql:host=mysql;dbname=demo;charset=utf8mb4" }
+            - { name: DB_USER, value: demo }
+            - { name: DB_PASS, value: demo }
+          ports: [{ containerPort: 9000 }]
+        - name: nginx
+          image: nginx:1.27
+          ports: [{ containerPort: 80 }]
+          volumeMounts:
+            - { name: nginx-conf, mountPath: /etc/nginx/conf.d }
+      volumes:
+        - name: nginx-conf
+          configMap: { name: nginx-conf }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: php-demo
+  namespace: phptrace
+spec:
+  selector: { app: php-demo }
+  ports: [{ port: 80, targetPort: 80 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: phptrace
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: loadgen } }
+  template:
+    metadata: { labels: { app: loadgen } }
+    spec:
+      containers:
+        - name: loadgen
+          image: curlimages/curl:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -- /fast /slow /db /cpu /mixed
+              while :; do
+                for ep in /fast /fast /fast /slow /slow /db /db /db /cpu /cpu /mixed; do
+                  curl -s -o /dev/null --max-time 10 "http://php-demo$ep" || true
+                done
+                sleep 0.1
+              done

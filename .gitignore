@@ -1,0 +1,14 @@
+data/
+!data/.gitkeep
+
+# Design-B experiment: frida-gadget prebuilt binary (28MB, fetch from frida releases)
+bench/fridaB/frida-gadget.so
+.lake/
+lean-tea/
+*.o
+*.bpf.o
+
+# local harness state
+.claude/
+data-native/
+*~

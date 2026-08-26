@@ -1,0 +1,52 @@
+# Bench-only PHP built with --enable-dtrace.
+#
+# Why: the task's per-call `execute_ex` condition is only real on a dtrace PHP.
+# With --enable-dtrace + USE_ZEND_DTRACE=1, zend_startup sets
+# zend_execute_ex = dtrace_execute_ex, which does NOT use the ZEND_VM_ENTER
+# inline fast-path — it fires the DTrace fbc-entry probe and calls execute_ex
+# per userland function call. So a uprobe on execute_ex fires per call (measured
+# ~tens of thousands per /cpu request), reproducing the 2024 prod incident where
+# prod ran a distro PHP with dtrace enabled. The official docker image ships
+# dtrace *disabled*, hence this rebuild. Bench-only; the main app image is stock.
+#
+# The image also carries bpftime (reused from the already-built
+# phptrace-php-bench image) + the percall loader, so it serves BOTH the
+# kernel-uprobe and bpftime dtrace conditions (see dtrace-entry.sh).
+
+FROM php:8.3-fpm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential autoconf pkg-config bison re2c file \
+      systemtap-sdt-dev \
+      libxml2-dev libssl-dev libcurl4-openssl-dev libreadline-dev zlib1g-dev \
+      libsodium-dev libargon2-dev libonig-dev libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
+# Rebuild PHP core with the image's original configure flags plus --enable-dtrace.
+RUN set -eux; \
+    docker-php-source extract; \
+    cd /usr/src/php; \
+    ./configure $(php-config --configure-options) --enable-dtrace; \
+    make -j"$(nproc)"; \
+    make install; \
+    docker-php-source delete; \
+    php -i | grep -i 'dtrace'; \
+    readelf -n /usr/local/sbin/php-fpm | grep -i stapsdt | head
+# Rebuild the extensions the demo app uses against the new core.
+RUN docker-php-ext-install opcache pdo_mysql mysqli >/dev/null
+
+FROM build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libboost-all-dev libyaml-cpp-dev libelf1 zlib1g libbpf1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY fpm-bench.conf /usr/local/etc/php-fpm.d/zz-bench.conf
+# bpftime runtime + percall program, reused from the bench image (same trixie
+# base, so ABI-compatible) — avoids a second multi-minute bpftime compile.
+COPY --from=phptrace-php-bench /opt/bpftime/ /opt/bpftime/
+COPY --from=phptrace-php-bench /opt/percall/ /opt/percall/
+COPY dtrace-entry.sh /opt/bench/dtrace-entry.sh
+RUN chmod +x /opt/bench/dtrace-entry.sh
+ENV BPF_OBJ=/opt/percall/percall.bpf.o
+ENV PHPFPM_BIN=/usr/local/sbin/php-fpm
+ENV BPFTIME_DIR=/opt/bpftime
+ENV BPFTIME_VM_NAME=ubpf
+ENV USE_ZEND_DTRACE=1
+ENTRYPOINT ["/opt/bench/dtrace-entry.sh"]

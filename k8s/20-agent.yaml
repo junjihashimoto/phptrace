@@ -1,0 +1,75 @@
+# phptrace agent — the canonical eBPF-profiler shape: a DaemonSet (one pod
+# per node) that discovers and samples every PHP process on the node via
+# hostPID, with no cooperation from the traced workloads.
+#
+# Two containers share an emptyDir at /data:
+#   tracer — the eBPF collector (privileged): 99Hz perf_event sampling of the
+#            Zend VM stack + request/mysqlnd uprobes -> /data/*.ndjson
+#   ui     — the lean-tea web app: ingests /data/*.ndjson into SQLite and
+#            serves the flamegraph / call-tree / rankings UI on :8080
+#
+# The tracer uses NO BTF / CO-RE (manual offsets + bpf_probe_read_user), so
+# it runs on nodes without kernel BTF. Symbol resolution reaches into each
+# traced container via /proc/<pid>/root, which hostPID + privileged provide.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: phptrace-agent
+  namespace: phptrace
+  labels: { app: phptrace-agent }
+spec:
+  selector: { matchLabels: { app: phptrace-agent } }
+  template:
+    metadata: { labels: { app: phptrace-agent } }
+    spec:
+      hostPID: true                      # see every pod's processes on the node
+      containers:
+        - name: tracer
+          image: phptrace-tracer:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true             # perf_event + BPF + cross-container /proc access
+          env:
+            - { name: DATA_DIR, value: /data }
+            - { name: SAMPLE_FREQ, value: "99" }
+            # report pids in the agent's pid namespace (k8s); the /proc scan
+            # and BPF then agree on pids across the nested namespaces.
+            - { name: NS_PIDS, value: "1" }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: debugfs, mountPath: /sys/kernel/debug }
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { memory: "256Mi" }
+        - name: ui
+          image: phptrace-ui:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: DB_PATH, value: /data/apm.sqlite }
+            - { name: DATA_DIR, value: /data }
+            - { name: PORT, value: "8080" }
+            - { name: RETENTION_HOURS, value: "2" }
+          ports: [{ containerPort: 8080, name: http }]
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { memory: "256Mi" }
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: debugfs
+          hostPath: { path: /sys/kernel/debug }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: phptrace-ui
+  namespace: phptrace
+spec:
+  type: NodePort
+  selector: { app: phptrace-agent }
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30080
